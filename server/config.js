@@ -29,6 +29,7 @@ module.exports = {
   LLM_PROVIDER: process.env.LLM_PROVIDER || 'openai', // "openai" | "groq"
   OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
   GROQ_API_KEY: process.env.GROQ_API_KEY || '',
+  GROQ_API_KEYS: (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || '').split(',').map(k => k.trim()).filter(Boolean),
   LLM_MODEL: process.env.LLM_MODEL || '', // auto-selected per provider if empty
   LLM_MAX_TOKENS: parseInt(process.env.LLM_MAX_TOKENS || '200'),
 

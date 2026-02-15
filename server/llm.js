@@ -2,49 +2,79 @@ const OpenAI = require('openai');
 const config = require('./config');
 const world = require('./world');
 
-let platformClient = null;
 let activeProvider = null;
 let activeModel = null;
 
 // Multi-key rotation: track rate-limited keys
 const rateLimitedKeys = new Map(); // key -> expiry timestamp
+let keyIndex = 0;
 
 const PROVIDER_DEFAULTS = {
   openai: { baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
   groq:   { baseURL: 'https://api.groq.com/openai/v1', model: 'llama-3.1-8b-instant' },
 };
 
-function getPlatformClient() {
-  if (platformClient) return platformClient;
+function getAvailableGroqKey() {
+  const keys = config.GROQ_API_KEYS || [];
+  if (keys.length === 0) return null;
+  const now = Date.now();
+  // Try each key starting from current index
+  for (let i = 0; i < keys.length; i++) {
+    const idx = (keyIndex + i) % keys.length;
+    const key = keys[idx];
+    const expiry = rateLimitedKeys.get(key);
+    if (!expiry || now > expiry) {
+      rateLimitedKeys.delete(key);
+      keyIndex = (idx + 1) % keys.length; // rotate for next call
+      return key;
+    }
+  }
+  return null; // all keys rate-limited
+}
 
+function markKeyRateLimited(apiKey) {
+  // Block key for 60 seconds
+  rateLimitedKeys.set(apiKey, Date.now() + 60000);
+}
+
+function getPlatformClient() {
   const provider = config.LLM_PROVIDER || 'openai';
-  const apiKey = provider === 'groq' ? config.GROQ_API_KEY : config.OPENAI_API_KEY;
+  const prov = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.openai;
+
+  let apiKey;
+  if (provider === 'groq') {
+    apiKey = getAvailableGroqKey();
+  } else {
+    apiKey = config.OPENAI_API_KEY;
+  }
 
   if (!apiKey) {
+    // Try fallback provider
     const fallback = provider === 'groq' ? 'openai' : 'groq';
-    const fallbackKey = fallback === 'groq' ? config.GROQ_API_KEY : config.OPENAI_API_KEY;
+    const fallbackKey = fallback === 'groq' ? getAvailableGroqKey() : config.OPENAI_API_KEY;
     if (fallbackKey) {
       const fb = PROVIDER_DEFAULTS[fallback];
-      platformClient = new OpenAI({ apiKey: fallbackKey, baseURL: fb.baseURL });
       activeProvider = fallback;
       activeModel = config.LLM_MODEL || fb.model;
-      console.log(`[LLM] Using fallback provider: ${fallback} (${activeModel})`);
-      return platformClient;
-    }
-    if (!getPlatformClient._warned) {
-      console.log('[LLM] No API key configured — using fallback random decisions');
-      getPlatformClient._warned = true;
+      return new OpenAI({ apiKey: fallbackKey, baseURL: fb.baseURL });
     }
     return null;
   }
 
-  const prov = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.openai;
-  platformClient = new OpenAI({ apiKey, baseURL: prov.baseURL });
   activeProvider = provider;
   activeModel = config.LLM_MODEL || prov.model;
-  console.log(`[LLM] Provider: ${provider} | Model: ${activeModel}`);
-  return platformClient;
+  const client = new OpenAI({ apiKey, baseURL: prov.baseURL });
+  client._groqKey = apiKey; // track which key this client uses
+  return client;
 }
+
+// Log available keys on startup
+(function logKeys() {
+  const keys = config.GROQ_API_KEYS || [];
+  if (keys.length > 0) {
+    console.log(`[LLM] Groq keys loaded: ${keys.length} (rotation enabled)`);
+  }
+})();
 
 function getModel() {
   return activeModel || config.LLM_MODEL || 'gpt-4o-mini';
@@ -54,7 +84,8 @@ function getModel() {
 // For agents with their own API keys, create per-call clients with rotation
 function getAgentClient(agent) {
   if (agent.llmMode === 'platform' || !agent.llmKeys || agent.llmKeys.length === 0) {
-    return { client: getPlatformClient(), model: getModel(), isPlatform: true };
+    const client = getPlatformClient();
+    return { client, model: getModel(), isPlatform: true, keyRef: client?._groqKey || null };
   }
 
   const now = Date.now();
@@ -78,11 +109,6 @@ function getAgentClient(agent) {
   const model = keyConfig.model || prov.model;
 
   return { client: agentClient, model, isPlatform: false, keyRef: keyConfig.key };
-}
-
-function markKeyRateLimited(key) {
-  // Mark key as rate-limited for 60 seconds
-  rateLimitedKeys.set(key, Date.now() + 60000);
 }
 
 // ===== RECENT ACTION MEMORY =====
