@@ -245,12 +245,25 @@ async function getTransactionStats() {
 }
 
 // ===== $REAI TOKEN ON-CHAIN BALANCE & SETTLEMENT =====
+// Gas-optimized for Monad: hardcoded gas limits (Monad charges gas_limit, not gas_used)
 const REAI_TOKEN = config.CONTRACT_ADDRESS; // $REAI token on nad.fun
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
   'function decimals() view returns (uint8)',
   'function transfer(address to, uint256 amount) returns (bool)',
 ];
+
+// Monad Multicall3 (same address as all EVM chains)
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const MULTICALL3_ABI = [
+  'function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[])',
+];
+
+// Hardcoded gas limits per Monad docs (Monad charges gas_limit, not gas_used)
+const GAS_LIMITS = {
+  NATIVE_TRANSFER: 21000n,
+  ERC20_TRANSFER: 65000n,
+};
 
 let tokenDecimals = null;
 
@@ -276,6 +289,35 @@ async function getReaiBalance(address) {
   }
 }
 
+// Batch-read all REAI balances via Multicall3 (1 RPC call instead of N)
+async function batchGetReaiBalances(addresses) {
+  try {
+    const tokenIface = new ethers.Interface(ERC20_ABI);
+    const calls = addresses.map(addr => ({
+      target: REAI_TOKEN,
+      allowFailure: true,
+      callData: tokenIface.encodeFunctionData('balanceOf', [addr]),
+    }));
+
+    const multicall = new ethers.Contract(MULTICALL3, MULTICALL3_ABI, getProvider());
+    const results = await multicall.aggregate3(calls);
+    const dec = await getTokenDecimals();
+
+    return results.map((r, i) => {
+      if (!r.success) return 0;
+      const bal = tokenIface.decodeFunctionResult('balanceOf', r.returnData)[0];
+      return parseFloat(ethers.formatUnits(bal, dec));
+    });
+  } catch (err) {
+    console.error('[CHAIN] Multicall balanceOf failed, falling back to sequential:', err.message);
+    const balances = [];
+    for (const addr of addresses) {
+      balances.push(await getReaiBalance(addr));
+    }
+    return balances;
+  }
+}
+
 // Settlement threshold: only settle if difference > 0.5 REAI
 const SETTLEMENT_THRESHOLD = 0.5;
 
@@ -295,9 +337,17 @@ async function settleAgentBalances() {
 
   console.log(`[SETTLE] Starting settlement for ${agents.length} agents...`);
 
-  for (const agent of agents) {
+  // Batch-read all on-chain balances in 1 RPC call via Multicall3
+  const addresses = agents.map(a => a.wallet_address);
+  const onChainBalances = await batchGetReaiBalances(addresses);
+
+  // Track local nonce for master wallet to avoid nonce collisions
+  let masterNonce = await getProvider().getTransactionCount(wallet.address, 'pending');
+
+  for (let i = 0; i < agents.length; i++) {
+    const agent = agents[i];
     try {
-      const onChainBal = await getReaiBalance(agent.wallet_address);
+      const onChainBal = onChainBalances[i];
       const dbBal = agent.xyz_balance || 0;
       const diff = dbBal - onChainBal;
 
@@ -310,7 +360,10 @@ async function settleAgentBalances() {
         // Agent EARNED net in-game: master sends REAI to agent
         const amount = ethers.parseUnits(diff.toFixed(6), dec);
         const masterToken = new ethers.Contract(REAI_TOKEN, ERC20_ABI, wallet);
-        const tx = await masterToken.transfer(agent.wallet_address, amount);
+        const tx = await masterToken.transfer(agent.wallet_address, amount, {
+          gasLimit: GAS_LIMITS.ERC20_TRANSFER,
+          nonce: masterNonce++,
+        });
         const receipt = await tx.wait();
 
         await recordTransaction('settlement', wallet.address, agent.wallet_address,
@@ -326,22 +379,31 @@ async function settleAgentBalances() {
         const sendAmount = Math.abs(diff);
         const amount = ethers.parseUnits(sendAmount.toFixed(6), dec);
 
-        // Fund agent with tiny MON for gas
+        // Fund agent with tiny MON for gas (hardcoded 21k gas limit for native transfer)
         const gasPrice = (await getProvider().getFeeData()).gasPrice || ethers.parseUnits('50', 'gwei');
-        const gasCost = gasPrice * 65000n; // ERC-20 transfer ~65k gas
+        const gasCost = gasPrice * GAS_LIMITS.ERC20_TRANSFER;
         const agentMonBal = await getProvider().getBalance(agent.wallet_address);
 
         if (agentMonBal < gasCost) {
-          const fundAmount = gasCost * 2n; // 2x buffer for safety
-          const fundTx = await wallet.sendTransaction({ to: agent.wallet_address, value: fundAmount });
+          const fundAmount = gasCost * 2n;
+          const fundTx = await wallet.sendTransaction({
+            to: agent.wallet_address,
+            value: fundAmount,
+            gasLimit: GAS_LIMITS.NATIVE_TRANSFER,
+            nonce: masterNonce++,
+          });
           await fundTx.wait();
           console.log(`[SETTLE] Funded ${agent.name} with ${ethers.formatEther(fundAmount)} MON for gas`);
         }
 
-        // Transfer REAI from agent wallet back to master
+        // Transfer REAI from agent wallet back to master (hardcoded 65k gas limit)
         const agentWallet = new ethers.Wallet(agent.wallet_private_key, getProvider());
+        const agentNonce = await getProvider().getTransactionCount(agentWallet.address, 'pending');
         const agentToken = new ethers.Contract(REAI_TOKEN, ERC20_ABI, agentWallet);
-        const tx = await agentToken.transfer(wallet.address, amount);
+        const tx = await agentToken.transfer(wallet.address, amount, {
+          gasLimit: GAS_LIMITS.ERC20_TRANSFER,
+          nonce: agentNonce,
+        });
         const receipt = await tx.wait();
 
         await recordTransaction('settlement', agent.wallet_address, wallet.address,
@@ -353,8 +415,8 @@ async function settleAgentBalances() {
         settled++;
       }
 
-      // Small delay between settlements to avoid nonce issues
-      await new Promise(r => setTimeout(r, 500));
+      // Small delay between settlements for nonce propagation
+      await new Promise(r => setTimeout(r, 300));
 
     } catch (err) {
       console.error(`[SETTLE] Error settling ${agent.name}: ${err.message}`);
@@ -393,6 +455,7 @@ async function withdrawFromAgent(agentPrivateKey, toAddress, amount) {
     const tx = await agentWallet.sendTransaction({
       to: toAddress,
       value,
+      gasLimit: GAS_LIMITS.NATIVE_TRANSFER,
     });
     const receipt = await tx.wait();
 
