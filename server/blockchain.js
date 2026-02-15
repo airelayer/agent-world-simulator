@@ -262,7 +262,7 @@ const MULTICALL3_ABI = [
 // Hardcoded gas limits per Monad docs (Monad charges gas_limit, not gas_used)
 const GAS_LIMITS = {
   NATIVE_TRANSFER: 21000n,
-  ERC20_TRANSFER: 65000n,
+  ERC20_TRANSFER: 100000n, // nad.fun tokens need ~80-90k (extra hooks/fees)
 };
 
 let tokenDecimals = null;
