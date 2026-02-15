@@ -498,4 +498,17 @@ router.get('/economy/stats', async (req, res) => {
   }
 });
 
+// POST /api/sync-balances — sync on-chain $REAI balances to DB
+router.post('/sync-balances', async (req, res) => {
+  try {
+    await blockchain.syncAgentReaiBalances();
+    const allAgents = agents.getAllAgents().map(a => ({
+      name: a.name, wallet: a.walletAddress, balance: a.xyzBalance
+    }));
+    res.json({ success: true, agents: allAgents });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

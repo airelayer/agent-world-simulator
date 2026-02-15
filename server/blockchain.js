@@ -244,6 +244,40 @@ async function getTransactionStats() {
   );
 }
 
+// ===== $REAI TOKEN ON-CHAIN BALANCE =====
+const REAI_TOKEN = config.CONTRACT_ADDRESS; // $REAI token on nad.fun
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+];
+
+async function getReaiBalance(address) {
+  try {
+    const token = new ethers.Contract(REAI_TOKEN, ERC20_ABI, getProvider());
+    const bal = await token.balanceOf(address);
+    const dec = await token.decimals();
+    return parseFloat(ethers.formatUnits(bal, dec));
+  } catch (err) {
+    return 0;
+  }
+}
+
+async function syncAgentReaiBalances() {
+  try {
+    const agents = await db.query('SELECT id, wallet_address FROM agents WHERE alive = 1');
+    for (const agent of agents) {
+      const onChainBal = await getReaiBalance(agent.wallet_address);
+      if (onChainBal > 0) {
+        await db.execute('UPDATE agents SET xyz_balance = ? WHERE id = ?', [onChainBal, agent.id]);
+      }
+    }
+    return true;
+  } catch (err) {
+    console.error('[CHAIN] REAI sync failed:', err.message);
+    return false;
+  }
+}
+
 // ===== WITHDRAW FROM AGENT WALLET =====
 async function withdrawFromAgent(agentPrivateKey, toAddress, amount) {
   try {
@@ -295,6 +329,6 @@ module.exports = {
   createAgentWallet, getBalance, withdrawFromAgent,
   recordTransaction, getRecentTransactions, getTransactionStats,
   onChainRegisterAgent, onChainClaimLand, onChainTrade, onChainBuild,
-  getOnChainStats,
+  getOnChainStats, getReaiBalance, syncAgentReaiBalances,
   CONTRACT_ABI,
 };

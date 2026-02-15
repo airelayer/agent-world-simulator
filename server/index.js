@@ -156,6 +156,11 @@ async function simulationTick() {
       }
     }
 
+    // ===== SYNC ON-CHAIN $REAI BALANCES (every 10 ticks) =====
+    if (meta.tickCount % 10 === 0 && meta.tickCount > 0) {
+      await blockchain.syncAgentReaiBalances();
+    }
+
     // ===== BROADCAST to all WebSocket clients =====
     const updatedAgents = agents.getAllAgents().map(a => agents.getAgentPublicData(a));
     const activities = await world.getRecentActivities(15);
