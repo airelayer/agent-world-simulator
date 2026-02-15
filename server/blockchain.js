@@ -244,38 +244,126 @@ async function getTransactionStats() {
   );
 }
 
-// ===== $REAI TOKEN ON-CHAIN BALANCE =====
+// ===== $REAI TOKEN ON-CHAIN BALANCE & SETTLEMENT =====
 const REAI_TOKEN = config.CONTRACT_ADDRESS; // $REAI token on nad.fun
 const ERC20_ABI = [
   'function balanceOf(address) view returns (uint256)',
   'function decimals() view returns (uint8)',
+  'function transfer(address to, uint256 amount) returns (bool)',
 ];
+
+let tokenDecimals = null;
+
+async function getTokenDecimals() {
+  if (tokenDecimals !== null) return tokenDecimals;
+  try {
+    const token = new ethers.Contract(REAI_TOKEN, ERC20_ABI, getProvider());
+    tokenDecimals = await token.decimals();
+    return tokenDecimals;
+  } catch {
+    return 18;
+  }
+}
 
 async function getReaiBalance(address) {
   try {
     const token = new ethers.Contract(REAI_TOKEN, ERC20_ABI, getProvider());
     const bal = await token.balanceOf(address);
-    const dec = await token.decimals();
+    const dec = await getTokenDecimals();
     return parseFloat(ethers.formatUnits(bal, dec));
   } catch (err) {
     return 0;
   }
 }
 
-async function syncAgentReaiBalances() {
-  try {
-    const agents = await db.query('SELECT id, wallet_address FROM agents WHERE alive = 1');
-    for (const agent of agents) {
-      const onChainBal = await getReaiBalance(agent.wallet_address);
-      if (onChainBal > 0) {
-        await db.execute('UPDATE agents SET xyz_balance = ? WHERE id = ?', [onChainBal, agent.id]);
-      }
-    }
-    return true;
-  } catch (err) {
-    console.error('[CHAIN] REAI sync failed:', err.message);
-    return false;
+// Settlement threshold: only settle if difference > 0.5 REAI
+const SETTLEMENT_THRESHOLD = 0.5;
+
+async function settleAgentBalances() {
+  const wallet = getMasterWallet();
+  if (!wallet || !REAI_TOKEN) {
+    console.log('[SETTLE] No master wallet or token configured, skipping');
+    return { settled: 0, skipped: 0, errors: 0 };
   }
+
+  const agents = await db.query(
+    'SELECT id, name, wallet_address, wallet_private_key, xyz_balance FROM agents WHERE alive = 1'
+  );
+
+  const dec = await getTokenDecimals();
+  let settled = 0, skipped = 0, errors = 0;
+
+  console.log(`[SETTLE] Starting settlement for ${agents.length} agents...`);
+
+  for (const agent of agents) {
+    try {
+      const onChainBal = await getReaiBalance(agent.wallet_address);
+      const dbBal = agent.xyz_balance || 0;
+      const diff = dbBal - onChainBal;
+
+      if (Math.abs(diff) < SETTLEMENT_THRESHOLD) {
+        skipped++;
+        continue;
+      }
+
+      if (diff > 0) {
+        // Agent EARNED net in-game: master sends REAI to agent
+        const amount = ethers.parseUnits(diff.toFixed(6), dec);
+        const masterToken = new ethers.Contract(REAI_TOKEN, ERC20_ABI, wallet);
+        const tx = await masterToken.transfer(agent.wallet_address, amount);
+        const receipt = await tx.wait();
+
+        await recordTransaction('settlement', wallet.address, agent.wallet_address,
+          { type: 'earn', agent: agent.name, diff: diff.toFixed(2), dbBal: dbBal.toFixed(2), onChainBal: onChainBal.toFixed(2) },
+          receipt.hash, Number(receipt.blockNumber)
+        );
+
+        console.log(`[SETTLE] +${diff.toFixed(2)} REAI -> ${agent.name} (${agent.wallet_address.slice(0,8)}...) | tx=${receipt.hash}`);
+        settled++;
+
+      } else {
+        // Agent SPENT net in-game: agent sends REAI back to master
+        const sendAmount = Math.abs(diff);
+        const amount = ethers.parseUnits(sendAmount.toFixed(6), dec);
+
+        // Fund agent with tiny MON for gas
+        const gasPrice = (await getProvider().getFeeData()).gasPrice || ethers.parseUnits('50', 'gwei');
+        const gasCost = gasPrice * 65000n; // ERC-20 transfer ~65k gas
+        const agentMonBal = await getProvider().getBalance(agent.wallet_address);
+
+        if (agentMonBal < gasCost) {
+          const fundAmount = gasCost * 2n; // 2x buffer for safety
+          const fundTx = await wallet.sendTransaction({ to: agent.wallet_address, value: fundAmount });
+          await fundTx.wait();
+          console.log(`[SETTLE] Funded ${agent.name} with ${ethers.formatEther(fundAmount)} MON for gas`);
+        }
+
+        // Transfer REAI from agent wallet back to master
+        const agentWallet = new ethers.Wallet(agent.wallet_private_key, getProvider());
+        const agentToken = new ethers.Contract(REAI_TOKEN, ERC20_ABI, agentWallet);
+        const tx = await agentToken.transfer(wallet.address, amount);
+        const receipt = await tx.wait();
+
+        await recordTransaction('settlement', agent.wallet_address, wallet.address,
+          { type: 'spend', agent: agent.name, diff: sendAmount.toFixed(2), dbBal: dbBal.toFixed(2), onChainBal: onChainBal.toFixed(2) },
+          receipt.hash, Number(receipt.blockNumber)
+        );
+
+        console.log(`[SETTLE] -${sendAmount.toFixed(2)} REAI <- ${agent.name} (${agent.wallet_address.slice(0,8)}...) | tx=${receipt.hash}`);
+        settled++;
+      }
+
+      // Small delay between settlements to avoid nonce issues
+      await new Promise(r => setTimeout(r, 500));
+
+    } catch (err) {
+      console.error(`[SETTLE] Error settling ${agent.name}: ${err.message}`);
+      errors++;
+    }
+  }
+
+  console.log(`[SETTLE] Done: ${settled} settled, ${skipped} skipped, ${errors} errors`);
+  return { settled, skipped, errors };
 }
 
 // ===== WITHDRAW FROM AGENT WALLET =====
@@ -329,6 +417,6 @@ module.exports = {
   createAgentWallet, getBalance, withdrawFromAgent,
   recordTransaction, getRecentTransactions, getTransactionStats,
   onChainRegisterAgent, onChainClaimLand, onChainTrade, onChainBuild,
-  getOnChainStats, getReaiBalance, syncAgentReaiBalances,
+  getOnChainStats, getReaiBalance, settleAgentBalances,
   CONTRACT_ABI,
 };

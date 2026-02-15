@@ -156,10 +156,7 @@ async function simulationTick() {
       }
     }
 
-    // ===== SYNC ON-CHAIN $REAI BALANCES (every 10 ticks) =====
-    if (meta.tickCount % 10 === 0 && meta.tickCount > 0) {
-      await blockchain.syncAgentReaiBalances();
-    }
+    // Settlement runs on its own 10-minute interval (see below), not per-tick
 
     // ===== BROADCAST to all WebSocket clients =====
     const updatedAgents = agents.getAllAgents().map(a => agents.getAgentPublicData(a));
@@ -271,6 +268,21 @@ async function start() {
   const tickInterval = setInterval(simulationTick, config.TICK_INTERVAL);
   console.log(`[SIM] Tick interval: ${config.TICK_INTERVAL}ms`);
 
+  // Start on-chain settlement every 10 minutes
+  const SETTLEMENT_INTERVAL = 10 * 60 * 1000; // 10 minutes
+  const settlementInterval = setInterval(async () => {
+    try {
+      console.log('[SETTLE] Running scheduled on-chain settlement...');
+      const result = await blockchain.settleAgentBalances();
+      if (result.settled > 0) {
+        await world.addActivity('settlement', `On-chain settlement: ${result.settled} agents settled`);
+      }
+    } catch (err) {
+      console.error('[SETTLE] Settlement failed:', err.message);
+    }
+  }, SETTLEMENT_INTERVAL);
+  console.log(`[SETTLE] On-chain settlement every 10 minutes`);
+
   // Start server
   server.listen(config.PORT, config.HOST, () => {
     console.log(`[SERVER] Running at http://localhost:${config.PORT}`);
@@ -285,6 +297,7 @@ async function start() {
   process.on('SIGINT', async () => {
     console.log('\n[SHUTDOWN] Saving state...');
     clearInterval(tickInterval);
+    clearInterval(settlementInterval);
     await db.setState('epoch', world.getWorldMeta().epoch);
     await db.setState('tickCount', world.getWorldMeta().tickCount);
     await db.setState('txnCount', world.getWorldMeta().txnCount);

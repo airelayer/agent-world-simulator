@@ -498,14 +498,14 @@ router.get('/economy/stats', async (req, res) => {
   }
 });
 
-// POST /api/sync-balances — sync on-chain $REAI balances to DB
-router.post('/sync-balances', async (req, res) => {
+// POST /api/settle-balances — run on-chain $REAI settlement (real ERC-20 transfers)
+router.post('/settle-balances', async (req, res) => {
   try {
-    await blockchain.syncAgentReaiBalances();
+    const result = await blockchain.settleAgentBalances();
     const allAgents = agents.getAllAgents().map(a => ({
       name: a.name, wallet: a.walletAddress, balance: a.xyzBalance
     }));
-    res.json({ success: true, agents: allAgents });
+    res.json({ success: true, ...result, agents: allAgents });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
