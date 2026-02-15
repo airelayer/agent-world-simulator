@@ -48,10 +48,10 @@ function getMasterWallet() {
 
 function getContract() {
   if (contract) return contract;
-  if (!config.CONTRACT_ADDRESS || CONTRACT_ABI.length === 0) return null;
+  if (!config.GAME_CONTRACT_ADDRESS || CONTRACT_ABI.length === 0) return null;
   const wallet = getMasterWallet();
   if (!wallet) return null;
-  contract = new ethers.Contract(config.CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
+  contract = new ethers.Contract(config.GAME_CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
   return contract;
 }
 

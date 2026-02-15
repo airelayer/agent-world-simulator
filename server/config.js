@@ -15,7 +15,8 @@ module.exports = {
   // Monad
   MONAD_RPC_URL: process.env.MONAD_RPC_URL || 'https://rpc.monad.xyz',
   MASTER_PRIVATE_KEY: process.env.MASTER_PRIVATE_KEY || '',
-  CONTRACT_ADDRESS: process.env.CONTRACT_ADDRESS || '',
+  CONTRACT_ADDRESS: process.env.CONTRACT_ADDRESS || '',       // $REAI token on nad.fun
+  GAME_CONTRACT_ADDRESS: process.env.GAME_CONTRACT_ADDRESS || '', // AgentWorld game contract
   MONAD_CHAIN_ID: 143,
 
   // World
